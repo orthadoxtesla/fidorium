@@ -58,6 +58,28 @@ fn encode_keepalive(cid: u32, status: u8) -> [u8; 64] {
     encode_response(cid, CMD_KEEPALIVE, &[status])[0]
 }
 
+/// Send CTAPHID keepalives until the returned sender fires, so the client keeps
+/// waiting while a dialog is open.
+fn spawn_keepalive(
+    outgoing_tx: &mpsc::Sender<[u8; 64]>,
+    cid: u32,
+) -> tokio::sync::oneshot::Sender<()> {
+    let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let tx_keepalive = outgoing_tx.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    tx_keepalive.send(encode_keepalive(cid, 0x02)).await.ok();
+                }
+                _ = &mut stop_rx => break,
+            }
+        }
+    });
+    stop_tx
+}
+
 /// `(private, public)` blobs, length-prefixed so they round-trip through one file.
 fn encode_blob(private: &[u8], public: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(4 + private.len() + public.len());
@@ -134,25 +156,29 @@ impl UserVerifier {
         cid: u32,
         cancel: &Arc<AtomicBool>,
     ) -> Result<UserPresenceProof, Ctap2Error> {
-        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
-        let tx_keepalive = outgoing_tx.clone();
-
         // Hold the client open across both the dialog and the TPM check.
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {
-                        tx_keepalive.send(encode_keepalive(cid, 0x02)).await.ok();
-                    }
-                    _ = &mut stop_rx => break,
-                }
-            }
-        });
-
+        let stop_tx = spawn_keepalive(outgoing_tx, cid);
         let result = self.prompt_and_verify(prompt, tpm, cancel).await;
         let _ = stop_tx.send(());
         result
+    }
+
+    /// Ask for a plain confirmation and nothing more.
+    ///
+    /// Answers the zero-length `pinUvAuthParam` probe that clients use to make
+    /// a device ask for a touch. It never asks for the passphrase and returns
+    /// no [`UserPresenceProof`], so it cannot lead to a signature.
+    pub(crate) async fn touch(
+        &self,
+        prompt: &UpPrompt,
+        outgoing_tx: &mpsc::Sender<[u8; 64]>,
+        cid: u32,
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<(), Ctap2Error> {
+        let stop_tx = spawn_keepalive(outgoing_tx, cid);
+        let result = self.confirm_only(prompt, cancel).await;
+        let _ = stop_tx.send(());
+        result.map(|_proof| ())
     }
 
     async fn prompt_and_verify(

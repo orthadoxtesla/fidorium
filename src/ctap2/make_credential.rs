@@ -30,6 +30,18 @@ pub(crate) async fn handle_make_credential(
         "MakeCredential options"
     );
 
+    // 0. A zero-length pinUvAuthParam is a touch probe (CTAP2 §6.1.2), not a
+    //    registration. Wait for the user, create nothing, and answer with
+    //    PIN_NOT_SET: we implement no clientPin, so there is no PIN to be
+    //    invalid.
+    if req.touch_probe {
+        verifier
+            .touch(&crate::up::touch_prompt(), outgoing_tx, cid, cancel)
+            .await?;
+        tracing::debug!(cid = format!("{cid:#010x}"), "Answered touch probe");
+        return Err(Ctap2Error::PinNotSet);
+    }
+
     // 1. Validate algorithm
     if !req.alg_ok {
         return Err(Ctap2Error::UnsupportedAlgorithm);

@@ -17,6 +17,8 @@ pub(crate) enum Ctap2Error {
     OperationDenied,
     #[error("user verification failed")]
     UvInvalid,
+    #[error("pin not set")]
+    PinNotSet,
     #[error("user action timeout")]
     UserActionTimeout,
     #[error("keepalive cancel")]
@@ -49,6 +51,7 @@ impl Ctap2Error {
             Self::CredentialExcluded => 0x19,
             Self::OperationDenied => 0x27,
             Self::UvInvalid => 0x3F,
+            Self::PinNotSet => 0x35,
             Self::UserActionTimeout => 0x2F,
             Self::KeepaliveCancel => 0x2D,
             Self::NoCredentials => 0x2E,
@@ -74,6 +77,10 @@ pub(crate) struct MakeCredentialRequest {
     pub user_verification: bool,
     pub exclude_list: Vec<Vec<u8>>,
     pub alg_ok: bool, // true if -7 (ES256) is in pubKeyCredParams
+    /// A zero-length `pinUvAuthParam` (key 8). Clients send this in a dummy
+    /// request, such as the `make.me.blink` RP, to make a device ask for a
+    /// touch so the user can pick an authenticator. It is not a registration.
+    pub touch_probe: bool,
 }
 
 #[derive(Debug)]
@@ -219,6 +226,11 @@ impl TryFrom<&[u8]> for MakeCredentialRequest {
         let resident_key = opt("rk").unwrap_or(false);
         let user_verification = opt("uv").unwrap_or(false);
 
+        // 8: pinUvAuthParam — only the zero-length touch probe is recognised.
+        let touch_probe = cbor_get(&map, 8)
+            .and_then(cbor_bytes)
+            .is_some_and(|b| b.is_empty());
+
         Ok(MakeCredentialRequest {
             client_data_hash,
             rp_id,
@@ -230,6 +242,7 @@ impl TryFrom<&[u8]> for MakeCredentialRequest {
             user_verification,
             exclude_list,
             alg_ok,
+            touch_probe,
         })
     }
 }
@@ -341,7 +354,53 @@ mod tests {
         ]))
     }
 
+    /// MakeCredential body shaped like the browser's `make.me.blink` touch
+    /// probe, with `pinUvAuthParam` set to `param` when given.
+    fn make_cred_with_auth_param(param: Option<&[u8]>) -> Vec<u8> {
+        let mut fields = vec![
+            (iv(1), bv(&[0u8; 32])),
+            (iv(2), mv(vec![(tv("id"), tv("make.me.blink"))])),
+            (iv(3), mv(vec![(tv("id"), bv(&[0u8]))])),
+            (
+                iv(4),
+                av(vec![mv(vec![
+                    (tv("alg"), iv(-7)),
+                    (tv("type"), tv("public-key")),
+                ])]),
+            ),
+        ];
+        if let Some(p) = param {
+            fields.push((iv(8), bv(p)));
+            fields.push((iv(9), iv(1)));
+        }
+        encode(mv(fields))
+    }
+
     // ---- MakeCredentialRequest parsing ----
+
+    #[test]
+    fn test_make_cred_zero_length_pin_uv_auth_is_touch_probe() {
+        let req =
+            MakeCredentialRequest::try_from(make_cred_with_auth_param(Some(&[])).as_slice())
+                .unwrap();
+        assert!(req.touch_probe, "empty pinUvAuthParam must be a touch probe");
+    }
+
+    #[test]
+    fn test_make_cred_non_empty_pin_uv_auth_is_not_touch_probe() {
+        let req = MakeCredentialRequest::try_from(
+            make_cred_with_auth_param(Some(&[0xAA; 16])).as_slice(),
+        )
+        .unwrap();
+        assert!(!req.touch_probe, "a real pinUvAuthParam is not a probe");
+    }
+
+    #[test]
+    fn test_make_cred_absent_pin_uv_auth_is_not_touch_probe() {
+        let req =
+            MakeCredentialRequest::try_from(make_cred_with_auth_param(None).as_slice()).unwrap();
+        assert!(!req.touch_probe, "no pinUvAuthParam means a normal request");
+    }
 
     #[test]
     fn test_make_cred_minimal_valid() {
@@ -550,5 +609,7 @@ mod tests {
         // CTAP2_ERR_UV_INVALID — a rejected passphrase, distinct from a
         // cancelled prompt (OPERATION_DENIED).
         assert_eq!(Ctap2Error::UvInvalid.status_byte(), 0x3F);
+        // The answer to a zero-length pinUvAuthParam touch probe.
+        assert_eq!(Ctap2Error::PinNotSet.status_byte(), 0x35);
     }
 }
